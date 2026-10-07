@@ -246,6 +246,13 @@ func (s *Sink) Close() (retErr error) {
 		return fmt.Errorf("failed to write meta: %v", err)
 	}
 
+	// Mark the snapshot as locally authored. Retention reconciliation never
+	// deletes snapshots that lack this marker, so a snapshot directory copied
+	// into the Store by an operator or external tool is always protected.
+	if err := writeOriginMarker(s.snapTmpDirPath); err != nil {
+		return fmt.Errorf("failed to write origin marker: %v", err)
+	}
+
 	if err := fsutil.SyncDirMaybe(s.snapTmpDirPath); err != nil {
 		return err
 	}
@@ -335,6 +342,26 @@ func writeMeta(dir string, meta *raft.SnapshotMeta) error {
 	enc := json.NewEncoder(fh)
 	if err = enc.Encode(meta); err != nil {
 		return fmt.Errorf("failed to encode meta: %v", err)
+	}
+	return fh.Sync()
+}
+
+// localOriginMarkerContent is the fixed content of the ORIGIN marker written
+// into every snapshot directory produced by a local sink.
+const localOriginMarkerContent = `{"origin":"local"}` + "\n"
+
+// writeOriginMarker writes the provenance marker identifying a snapshot as
+// authored by this Store's own sink. It is written before the snapshot
+// directory is renamed into place and travels with any later directory rename
+// (e.g. reaping consolidation).
+func writeOriginMarker(dir string) error {
+	fh, err := os.Create(filepath.Join(dir, originMarkerFile))
+	if err != nil {
+		return fmt.Errorf("error creating origin marker file: %v", err)
+	}
+	defer fh.Close()
+	if _, err := fh.WriteString(localOriginMarkerContent); err != nil {
+		return fmt.Errorf("error writing origin marker: %v", err)
 	}
 	return fh.Sync()
 }

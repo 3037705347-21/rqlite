@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -289,5 +290,48 @@ func TestFilePersistence(t *testing.T) {
 	}
 	if p2.NReaped != 1 || p2.NCheckpointed != 1 {
 		t.Fatalf("expected NReaped=1, NCheckpointed=1, got %d, %d", p2.NReaped, p2.NCheckpointed)
+	}
+}
+
+func TestPlanRecordPathRoundtrip(t *testing.T) {
+	p := New()
+	p.AddRemoveAll("snap")
+	p.RecordPath = "RECONCILE-1.json"
+
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	p2 := New()
+	if err := json.Unmarshal(data, p2); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if p2.RecordPath != "RECONCILE-1.json" {
+		t.Fatalf("expected record path to roundtrip, got %q", p2.RecordPath)
+	}
+}
+
+// TestPlanBackwardsCompatibleJSON ensures plans written by older releases,
+// which have no record_path field, still decode and re-serialize cleanly.
+func TestPlanBackwardsCompatibleJSON(t *testing.T) {
+	oldJSON := `{"ops":[{"type":"remove_all","src":"snap"}],"n_reaped":1}`
+	p := New()
+	if err := json.Unmarshal([]byte(oldJSON), p); err != nil {
+		t.Fatalf("unmarshal of old plan JSON failed: %v", err)
+	}
+	if p.RecordPath != "" {
+		t.Fatalf("expected empty record path for old plan, got %q", p.RecordPath)
+	}
+	if p.NReaped != 1 || p.Len() != 1 {
+		t.Fatalf("unexpected decoded plan: %+v", p)
+	}
+
+	// A plan without a record path must not serialize the field either.
+	data, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if bytes.Contains(data, []byte("record_path")) {
+		t.Fatalf("expected no record_path in serialized plan, got %s", data)
 	}
 }

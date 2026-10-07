@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,27 @@ const (
 	walfileSuffix  = ".wal"
 	fullNeededFile = "FULL_NEEDED"
 	reapPlanFile   = "REAP_PLAN"
+
+	// originMarkerFile is written inside every snapshot directory created by
+	// this Store's own sink. Its presence is the provenance signal used by
+	// retention reconciliation: a snapshot without it is treated as copied in
+	// from outside the store and is never deleted automatically.
+	originMarkerFile = "ORIGIN"
+
+	// retentionPolicyFile is the optional JSON retention policy for the Store.
+	// While present, snapshot maintenance runs as retention reconciliation
+	// instead of legacy reaping; when absent, legacy reaping is used.
+	retentionPolicyFile = "RETENTION"
+
+	// reconcilePlanFile is the crash-recovery plan for an interrupted
+	// retention reconciliation, analogous to reapPlanFile for reaping.
+	reconcilePlanFile = "RECONCILE_PLAN"
+
+	// reconcileRecordPrefix/suffix name the per-run, auditable reconciliation
+	// records left at the root of the Store directory. Root files are ignored
+	// by the snapshot catalog scan, which only loads subdirectories.
+	reconcileRecordPrefix = "RECONCILE-"
+	reconcileRecordSuffix = ".json"
 
 	defaultReapThreshold = 4
 	defaultReadTimeout   = 30 * time.Second
@@ -48,6 +70,15 @@ const (
 	reapWALs            = "reap_wals"
 	reapPlanRecovered   = "reap_plan_recovered"
 	readTimeoutTotal    = "read_timeout_total"
+
+	reconcileDuration      = "reconcile_duration_ms"
+	reconcileTotal         = "reconcile_total"
+	reconcileErrors        = "reconcile_errors"
+	reconcileInvalidPolicy = "reconcile_invalid_policy"
+	reconcileSnapshots     = "reconcile_snapshots"
+	reconcilePinned        = "reconcile_pinned"
+	reconcileForeign       = "reconcile_foreign"
+	reconcilePlanRecovered = "reconcile_plan_recovered"
 
 	upgradeOk   = "upgrade_ok"
 	upgradeFail = "upgrade_fail"
@@ -91,6 +122,14 @@ func ResetStats() {
 	stats.Add(reapWALs, 0)
 	stats.Add(reapPlanRecovered, 0)
 	stats.Add(readTimeoutTotal, 0)
+	stats.Add(reconcileDuration, 0)
+	stats.Add(reconcileTotal, 0)
+	stats.Add(reconcileErrors, 0)
+	stats.Add(reconcileInvalidPolicy, 0)
+	stats.Add(reconcileSnapshots, 0)
+	stats.Add(reconcilePinned, 0)
+	stats.Add(reconcileForeign, 0)
+	stats.Add(reconcilePlanRecovered, 0)
 	stats.Add(upgradeOk, 0)
 	stats.Add(upgradeFail, 0)
 }
@@ -209,7 +248,17 @@ type Store struct {
 	dir            string
 	fullNeededPath string
 	reapPlanPath   string
-	logger         *log.Logger
+
+	// retentionPolicyPath holds the optional RETENTION policy. While the file
+	// exists, background maintenance runs retention reconciliation instead of
+	// legacy reaping.
+	retentionPolicyPath string
+
+	// reconcilePlanPath is the crash-recovery plan for an interrupted
+	// retention reconciliation.
+	reconcilePlanPath string
+
+	logger *log.Logger
 
 	catalog *SnapshotCatalog
 
@@ -259,20 +308,22 @@ func NewStore(dir string) (*Store, error) {
 
 	logger := log.New(os.Stderr, "[snapshot-store] ", log.LstdFlags)
 	str := &Store{
-		dir:            dir,
-		fullNeededPath: filepath.Join(dir, fullNeededFile),
-		reapPlanPath:   filepath.Join(dir, reapPlanFile),
-		catalog:        &SnapshotCatalog{},
-		snapshotNamer:  NewSnapshotNamer(nil),
-		mrsw:           rsync.NewMultiRSW(),
-		reapDisabled:   &rsync.AtomicBool{},
-		noVerifyDB:     &rsync.AtomicBool{},
-		reapThreshold:  defaultReapThreshold,
-		readTimeout:    defaultReadTimeout,
-		reapCh:         make(chan struct{}, 1),
-		reapDoneCh:     make(chan struct{}),
-		observers:      newObserverSet(),
-		logger:         logger,
+		dir:                 dir,
+		fullNeededPath:      filepath.Join(dir, fullNeededFile),
+		reapPlanPath:        filepath.Join(dir, reapPlanFile),
+		retentionPolicyPath: filepath.Join(dir, retentionPolicyFile),
+		reconcilePlanPath:   filepath.Join(dir, reconcilePlanFile),
+		catalog:             &SnapshotCatalog{},
+		snapshotNamer:       NewSnapshotNamer(nil),
+		mrsw:                rsync.NewMultiRSW(),
+		reapDisabled:        &rsync.AtomicBool{},
+		noVerifyDB:          &rsync.AtomicBool{},
+		reapThreshold:       defaultReapThreshold,
+		readTimeout:         defaultReadTimeout,
+		reapCh:              make(chan struct{}, 1),
+		reapDoneCh:          make(chan struct{}),
+		observers:           newObserverSet(),
+		logger:              logger,
 		fatalFn: func(err error) {
 			logger.Fatalf("fatal snapshot integrity error, exiting process: %s", err)
 		},
@@ -420,10 +471,11 @@ func (s *Store) Open(id string) (raftMeta *raft.SnapshotMeta, rc io.ReadCloser, 
 		}
 	}()
 
-	// A failed reap may have checkpointed WALs into the database without
-	// updating its metadata. Do not expose that state until the plan completes.
-	// The read lock prevents a reap from starting between this check and use.
-	if fsutil.FileExists(s.reapPlanPath) {
+	// A failed reap or reconciliation may have checkpointed WALs into the
+	// database without updating its metadata. Do not expose that state until
+	// the pending plan completes. The read lock prevents maintenance from
+	// starting between this check and use.
+	if fsutil.FileExists(s.reapPlanPath) || fsutil.FileExists(s.reconcilePlanPath) {
 		return nil, nil, ErrReapPending
 	}
 
@@ -561,6 +613,23 @@ func (s *Store) reap() (int, int, error) {
 
 // reapInternal performs the actual reap logic. The caller must hold the write lock.
 func (s *Store) reapInternal() (int, int, error) {
+	// If maintenance under a retention policy was interrupted, complete it
+	// before falling back to legacy reaping, so no pending plan is ever
+	// superseded by a different maintenance kind.
+	if fsutil.FileExists(s.reconcilePlanPath) {
+		s.logger.Printf("found interrupted reconcile plan at %s while reaping, resuming", s.reconcilePlanPath)
+		stats.Add(reconcilePlanRecovered, 1)
+		p, err := plan.ReadFromFile(s.reconcilePlanPath)
+		if err != nil {
+			return 0, 0, fmt.Errorf("reading reconcile plan: %w", err)
+		}
+		rec, err := s.executeReconcilePlan(p, s.reconcilePlanPath)
+		if err != nil {
+			return 0, 0, err
+		}
+		return rec.SnapshotsDeleted, rec.WALsCheckpointed, nil
+	}
+
 	// If a reap plan file exists, that means a previous reap must have encountered an error.
 	// Let's make sure it is completed before we start a new reap.
 	if fsutil.FileExists(s.reapPlanPath) {
@@ -827,19 +896,36 @@ func (s *Store) reapLoop() {
 		}
 
 		startT := time.Now()
-		n, c, err := func() (int, int, error) {
+		var n, c int
+		var err error
+		func() {
 			defer recordDuration(autoReapDuration, startT)
 			s.mrsw.BeginWriteBlocking("reap")
 			defer s.mrsw.EndWrite()
-			return s.reap()
+			// A retention policy switches maintenance to reconciliation;
+			// without one, legacy reaping is used unchanged.
+			if fsutil.FileExists(s.retentionPolicyPath) {
+				var rec *ReconcileRecord
+				rec, err = s.reconcile()
+				if rec != nil {
+					n, c = rec.SnapshotsDeleted, rec.WALsCheckpointed
+				}
+			} else {
+				n, c, err = s.reap()
+			}
 		}()
 		if err != nil {
-			s.logger.Printf("reap failed: %s", err)
+			if errors.Is(err, ErrNoRetentionPolicy) {
+				// Policy was removed between the dispatch check and taking the
+				// lock; the next signal will run legacy reaping.
+				continue
+			}
+			s.logger.Printf("snapshot maintenance failed: %s", err)
 			stats.Add(reapErrors, 1)
 			continue
 		}
 		if s.LogReaping {
-			s.logger.Printf("autoreap complete in %s: %d snapshots reaped, %d WALs checkpointed",
+			s.logger.Printf("automatic snapshot maintenance complete in %s: %d snapshots reaped, %d WALs checkpointed",
 				time.Since(startT), n, c)
 		}
 	}
@@ -865,6 +951,7 @@ func (s *Store) check() error {
 
 	// Remove any incomplete plan file from an interrupted plan write.
 	fsutil.Remove(tmpName(s.reapPlanPath))
+	fsutil.Remove(tmpName(s.reconcilePlanPath))
 
 	// Resume an interrupted reap if a plan file exists, before any temporary
 	// directories are removed below, since the reap may still need them.
@@ -900,6 +987,30 @@ func (s *Store) check() error {
 		}
 	}
 
+	// Resume an interrupted retention reconciliation, if present, before
+	// temporary directories are removed and before orphan records are finalized
+	// below. Replaying converges to the planned end state.
+	if fsutil.FileExists(s.reconcilePlanPath) {
+		s.logger.Printf("found interrupted reconcile plan at %s", s.reconcilePlanPath)
+		stats.Add(reconcilePlanRecovered, 1)
+		p, err := plan.ReadFromFile(s.reconcilePlanPath)
+		if err != nil {
+			return fmt.Errorf("reading reconcile plan: %w", err)
+		}
+		done, err := p.LastOpDone(plan.NewChecker())
+		if err != nil {
+			return fmt.Errorf("checking reconcile plan completion: %w", err)
+		}
+		if !done {
+			if _, err := s.executeReconcilePlan(p, s.reconcilePlanPath); err != nil {
+				return fmt.Errorf("executing reconcile plan: %w", err)
+			}
+		} else {
+			s.logger.Printf("reconcile plan at %s is fully executed, removing plan", s.reconcilePlanPath)
+			fsutil.Remove(s.reconcilePlanPath)
+		}
+	}
+
 	// Anything remaining is truly temporary and can now be cleaned up.
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -912,7 +1023,23 @@ func (s *Store) check() error {
 			if err := fsutil.RemoveAll(tmpPath); err != nil {
 				return fmt.Errorf("removing temporary directory %s: %w", tmpPath, err)
 			}
+			continue
 		}
+		// Remove temp files left by an interrupted atomic reconcile record
+		// write.
+		if !e.IsDir() && isTmpName(e.Name()) &&
+			strings.HasPrefix(e.Name(), reconcileRecordPrefix) {
+			if err := fsutil.Remove(filepath.Join(s.dir, e.Name())); err != nil {
+				return fmt.Errorf("removing temporary reconcile record %s: %w", e.Name(), err)
+			}
+		}
+	}
+
+	// A reconciliation record still marked "running" with no plan on disk means
+	// the run stopped before its atomic plan write, i.e. before any deletion.
+	// Mark such records interrupted so the audit trail is explicit.
+	if err := s.finalizeInterruptedRecords(); err != nil {
+		return err
 	}
 	return nil
 }

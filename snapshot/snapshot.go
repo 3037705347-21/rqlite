@@ -82,6 +82,12 @@ type Snapshot struct {
 	typ      Type
 	raftMeta *raft.SnapshotMeta
 
+	// local reports whether the snapshot was authored by this Store's own
+	// sink, i.e. the ORIGIN marker is present in its directory. Snapshots
+	// copied into the Store by an operator or external tool lack the marker
+	// and are never deleted by retention reconciliation.
+	local bool
+
 	// dbFile is the DB file and its CRC32. Populated for full snapshots.
 	dbFile *ChecksummedFile
 
@@ -120,6 +126,19 @@ func (s *Snapshot) Equal(other *Snapshot) bool {
 // String returns a string representation of the snapshot.
 func (s *Snapshot) String() string {
 	return fmt.Sprintf("Snapshot{id=%s, type=%v, term=%d, index=%d}", s.id, s.typ, s.raftMeta.Term, s.raftMeta.Index)
+}
+
+// ID returns the snapshot ID, which is also its directory name under the
+// Store root.
+func (s *Snapshot) ID() string {
+	return s.id
+}
+
+// IsLocal reports whether the snapshot was authored by this Store's own sink.
+// A false result means the snapshot directory was copied into the Store from
+// outside and retention reconciliation must not delete, rewrite, or rename it.
+func (s *Snapshot) IsLocal() bool {
+	return s.local
 }
 
 // Type describes the declared kind of a Snapshot.
@@ -530,6 +549,7 @@ func (c *SnapshotCatalog) loadSnapshot(path string, id string) (*Snapshot, error
 		id:       id,
 		path:     path,
 		raftMeta: meta,
+		local:    fsutil.FileExists(filepath.Join(path, originMarkerFile)),
 	}
 
 	dataDBPath := filepath.Join(path, dbfileName)

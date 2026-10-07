@@ -85,7 +85,7 @@ Two streamer types produce the byte stream that Raft reads when it needs to send
 
 ### Maintaining the Store: Reaping
 
-Over time, incremental snapshots accumulate. **Reaping** consolidates them into a single up-to-date full snapshot and removes obsolete snapshots. It is the only operation that deletes snapshot data.
+Over time, incremental snapshots accumulate. **Reaping** consolidates them into a single up-to-date full snapshot and removes obsolete snapshots. It is the default maintenance operation and the only legacy operation that deletes snapshot data.
 
 Reaping is triggered automatically by a background goroutine (`reapLoop`) when the snapshot count exceeds a configurable threshold, or manually via `Store.Reap()`. The process:
 
@@ -108,6 +108,47 @@ If reaping fails while the store is running, `Open` returns `ErrReapPending` whi
 #### Concurrency: MRSW Lock
 
 The store uses a multi-reader single-writer (MRSW) lock. Creating or reading snapshots requires only a read lock — multiple snapshots can be created and read concurrently. Reaping requires the write lock and waits for all active readers to finish. The `LockingSink` and `LockingStreamer` wrappers ensure the lock is held for the duration of the operation and released on `Close`.
+
+### Maintaining the Store: Retention Reconciliation
+
+Legacy reaping collapses everything into a single newest full snapshot, so operators cannot keep database state at chosen points in time. When a **retention policy** file named `RETENTION` exists at the Store root, maintenance switches from reaping to **reconciliation**, which keeps a configurable number of full snapshots as recovery points and never touches protected snapshots. The file is read afresh on every run, so adding, editing, or removing it changes behavior without a restart; removing it restores legacy reaping unchanged.
+
+The policy is JSON:
+
+```json
+{
+  "retain_full": 3,
+  "pinned": ["2-100-1686659761026"]
+}
+```
+
+- `retain_full` (required, >= 1) declares how many of the newest full snapshots to retain.
+- `pinned` (optional) lists snapshot IDs (`term-index-millisecond`, i.e. the snapshot directory names) to keep indefinitely while the policy is in effect.
+
+Validation is strict and fails closed: malformed JSON, unknown fields, `retain_full < 1`, malformed or duplicated pins, or a pin naming a snapshot not currently in the Store all make the policy invalid, in which case reconciliation writes a record and **deletes nothing**.
+
+#### Provenance: the ORIGIN marker
+
+Every snapshot produced by a local `Sink` carries an `ORIGIN` marker file in its snapshot directory, written before the directory is renamed into place and carried along by later reaping renames. A snapshot directory copied into the Store by an operator or external tool lacks this marker and is classified as **foreign**. Foreign snapshots are never deleted, rewritten, or renamed by reconciliation — the classification deliberately fails toward protection when local authorship cannot be proven. Snapshots produced by the v7/v8 upgrader also lack the marker.
+
+#### What reconciliation keeps
+
+A snapshot is **protected** if it is pinned or foreign; protected snapshots are never deleted, rewritten, or renamed. Given the ordered set of snapshots (oldest to newest):
+
+1. The retention boundary is the `retain_full`-th newest full snapshot; everything at or newer than the boundary is retained.
+2. A protected incremental older than the boundary pulls the boundary back to its nearest preceding full snapshot (dependency closure), so a retained incremental never loses the full it resolves against. If no preceding full exists, everything is retained.
+3. Snapshots strictly older than the boundary are deleted only when they are locally authored and not pinned.
+4. The trailing incrementals after the newest full are folded into that full exactly as reaping does (checkpoint WALs, recompute CRC32, rewrite metadata, rename), but only along a contiguous locally-authored, unpinned prefix. Folding stops at the first protected trailing incremental — frames must stay ordered — leaving that incremental and everything after it resolvable against the consolidated full. If the newest full itself is protected, it is never rewritten and no folding occurs.
+
+#### Reconciliation records
+
+Every policy-driven run leaves one auditable record file at the Store root, named `RECONCILE-<millisecond>.json`. The millisecond is raised past any existing record, so record IDs are unique and time-ordered even if the wall clock moves backwards. The record holds the run's start/finish time, status, the policy snapshot, the policy error if rejected, the full observed set (each snapshot's ID, type, term, index, local/pinned flags), pinned/foreign/retained/deleted ID lists, consolidation details, and any error. The record is written atomically **before** any deletion.
+
+Statuses: `running` (record staged, nothing necessarily done yet), `applied` (plan completed, including zero-deletion runs), `aborted_invalid_policy` (nothing deleted), `error` (a pre-plan failure, nothing deleted), and `interrupted` (assigned at startup to a `running` record whose plan never reached disk).
+
+#### Crash safety and convergence
+
+Reconciliation uses the same plan-execute machinery as reaping: a `RECONCILE_PLAN` file (a `plan.Plan` carrying its record's path) is atomically written after the record and before execution, and every operation is idempotent. On startup `check()` resumes an interrupted reconcile plan (the `Open` path reports `ErrReapPending` while either kind of plan is pending), and a `running` record left without a plan is marked `interrupted`. A legacy `Reap()` or another `Reconcile()` invoked while the other kind of plan is pending completes that pending plan first. Because every operation is idempotent and each run rescans the Store, rerunning after an interruption converges to the same end state and a second run with an unchanged policy performs no deletions.
 
 ### Restoring from Snapshots
 
@@ -137,7 +178,7 @@ The `SnapshotHeader` protobuf uses a `oneof` payload:
 
 ## Store Lifecycle
 
-1. **Startup** (`NewStore`): Creates the store directory, runs `check()` to clean up temporary directories and resume interrupted reap plans, and starts the reaper goroutine.
+1. **Startup** (`NewStore`): Creates the store directory, runs `check()` to clean up temporary directories, resume interrupted reap or reconcile plans, and finalize interrupted reconcile records, and starts the reaper goroutine.
 
 2. **Creating snapshots** (`Create`): Acquires a read lock, creates a `Sink` in a temporary directory, returns a `LockingSink` to Raft.
 
@@ -145,7 +186,7 @@ The `SnapshotHeader` protobuf uses a `oneof` payload:
 
 4. **Listing snapshots** (`List`): Returns only the most recent snapshot's metadata (per the `raft.SnapshotStore` contract). `ListAll` returns all snapshots.
 
-5. **Reaping**: Triggered by the reaper goroutine after a successful snapshot persist (`LockingSink.Close` signals the reaper). Also available as `Store.Reap()` for manual invocation.
+5. **Maintenance**: Triggered by the reaper goroutine after a successful snapshot persist (`LockingSink.Close` signals the reaper). If a `RETENTION` policy file exists the goroutine runs retention reconciliation (`Store.Reconcile()`), otherwise it runs legacy reaping (`Store.Reap()`); both are also available as manual calls.
 
 6. **Shutdown** (`Close`): Stops the reaper goroutine and waits for it to exit.
 

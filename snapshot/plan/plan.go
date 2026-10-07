@@ -94,6 +94,11 @@ type Plan struct {
 	Ops           []Operation `json:"ops"`
 	NReaped       int         `json:"n_reaped,omitempty"`
 	NCheckpointed int         `json:"n_checkpointed,omitempty"`
+
+	// RecordPath optionally records the filesystem path of the audit record
+	// associated with this plan. It is set by retention reconciliation, which
+	// leaves a per-run record alongside its plan; reaping leaves it empty.
+	RecordPath string `json:"record_path,omitempty"`
 }
 
 // New returns a new, empty Plan.
