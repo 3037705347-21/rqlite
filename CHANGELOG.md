@@ -1,4 +1,7 @@
 ## v10.5.3 (unreleased)
+### New features
+- Receiving-side snapshot chain reconciliation: on startup and after every incoming full-snapshot install, the Snapshot Store compares its committed snapshots against the authoritative incoming snapshot chain. Only the node's own interrupted intermediates (sink `.tmp` directories and the registered WAL staging directory) are removed; externally copied snapshots and other foreign files are never touched. A broken incremental chain durably requests a full snapshot (`FULL_NEEDED`) and converges once the full snapshot arrives; discrepancies that cannot be judged safely stop the node with a detailed error and change nothing.
+
 ### Implementation changes and bug fixes
 - [PR #2844](https://github.com/rqlite/rqlite/pull/2844): Unit-test WAL-related compile-time options, to ensure SQLite operates as per rqlite needs.
 - [PR #2845](https://github.com/rqlite/rqlite/pull/2845): Check Raft snapshot threshold every 5 seconds by default.

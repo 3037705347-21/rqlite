@@ -501,6 +501,10 @@ func (c *SnapshotCatalog) Scan(dir string) (SnapshotSet, error) {
 		if !entry.IsDir() || isTmpName(entry.Name()) {
 			continue
 		}
+		// Note: every non-temporary directory is treated as a snapshot here,
+		// including ones with unrecognized names. The receiving-side
+		// reconciler performs its own, stricter ownership classification
+		// (snapshot-shaped vs foreign) before deciding what may be removed.
 
 		snapshotPath := filepath.Join(dir, entry.Name())
 		snapshot, err := c.loadSnapshot(snapshotPath, entry.Name())

@@ -51,6 +51,12 @@ const (
 
 	upgradeOk   = "upgrade_ok"
 	upgradeFail = "upgrade_fail"
+
+	reconcileTotal        = "reconcile_total"
+	reconcileFullRequired = "reconcile_full_required_total"
+	reconcileConflicts    = "reconcile_conflict_total"
+	reconcileTransients   = "reconcile_transients_removed"
+	reconcileSnapshots    = "reconcile_snapshots"
 )
 
 var (
@@ -93,6 +99,11 @@ func ResetStats() {
 	stats.Add(readTimeoutTotal, 0)
 	stats.Add(upgradeOk, 0)
 	stats.Add(upgradeFail, 0)
+	stats.Add(reconcileTotal, 0)
+	stats.Add(reconcileFullRequired, 0)
+	stats.Add(reconcileConflicts, 0)
+	stats.Add(reconcileTransients, 0)
+	stats.Add(reconcileSnapshots, 0)
 }
 
 // ErrSnapshotReaderTimeout is returned by Read after the LockingStreamer has
@@ -211,6 +222,11 @@ type Store struct {
 	reapPlanPath   string
 	logger         *log.Logger
 
+	// stagingPaths are node-owned staging directories outside the snapshot
+	// store root (e.g. the FSM's WAL staging directory) that receiving-side
+	// reconciliation is allowed to remove when it finds them left behind.
+	stagingPaths []string
+
 	catalog *SnapshotCatalog
 
 	snapshotNamer *SnapshotNamer
@@ -251,8 +267,22 @@ type Store struct {
 	LogReaping bool
 }
 
+// StoreOption customizes a Store at construction time.
+type StoreOption func(*Store)
+
+// WithStagingPaths registers node-owned staging directories outside the
+// snapshot store root that receiving-side reconciliation is allowed to remove
+// when they are left behind by an interrupted snapshot (for example the FSM's
+// WAL staging directory). Unsafe paths (empty, relative, root, or the store
+// directory itself) are ignored.
+func WithStagingPaths(paths ...string) StoreOption {
+	return func(s *Store) {
+		s.stagingPaths = append(s.stagingPaths, paths...)
+	}
+}
+
 // NewStore creates a new store.
-func NewStore(dir string) (*Store, error) {
+func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
@@ -276,6 +306,9 @@ func NewStore(dir string) (*Store, error) {
 		fatalFn: func(err error) {
 			logger.Fatalf("fatal snapshot integrity error, exiting process: %s", err)
 		},
+	}
+	for _, opt := range opts {
+		opt(str)
 	}
 	str.logger.Printf("store initialized using %s", dir)
 
@@ -762,6 +795,51 @@ func (s *Store) SetDueNext(t Type) error {
 	}
 }
 
+// Reconcile compares the local snapshots and node-owned staging artifacts
+// against the given authoritative incoming snapshot chain. It removes only
+// intermediate artifacts this node itself left behind (interrupted sink
+// directories and registered staging directories); committed snapshots,
+// including snapshots copied in externally, are never removed.
+//
+// If the committed chain is broken it sets FULL_NEEDED so that the next
+// delivered snapshot must be a full snapshot. If the store cannot be reconciled
+// safely it returns ErrReconcileConflict with detailed reasons and changes
+// nothing; the caller must stop rather than guessing. Repeating the call
+// converges.
+//
+// It must not be invoked while a snapshot install is in progress.
+func (s *Store) Reconcile(chain *IncomingChain) (*ReconcileReport, error) {
+	s.mrsw.BeginWriteBlocking("reconcile")
+	defer s.mrsw.EndWrite()
+	return NewReconciler(s.dir, s.stagingPaths, s.logger).Reconcile(chain)
+}
+
+// ReconcileIncoming is the narrow hook invoked by the Sink after a
+// successfully installed incoming snapshot. It attempts the reconciliation
+// without blocking: if snapshot readers (e.g. a slow transfer to a follower)
+// or a reap are active, the pass is deferred to the next install or to
+// startup check() rather than stalling completion of the just-finished
+// snapshot. Deferring is safe because a successful full install anchors the
+// committed chain, and all transient cleanup is idempotent.
+func (s *Store) ReconcileIncoming(chain *IncomingChain) error {
+	if err := s.mrsw.BeginWrite("reconcile"); err != nil {
+		var conflict *rsync.ErrMRSWConflict
+		if errors.As(err, &conflict) {
+			s.logger.Printf("snapshot store busy (%v); deferring incoming reconciliation until next install or startup", err)
+			return nil
+		}
+		return err
+	}
+	defer s.mrsw.EndWrite()
+
+	report, err := NewReconciler(s.dir, s.stagingPaths, s.logger).Reconcile(chain)
+	if err != nil {
+		return err
+	}
+	s.logger.Printf("incoming snapshot reconciliation: %s", report.Reason)
+	return nil
+}
+
 // Stats returns stats about the Snapshot Store. This function may return
 // an error if the Store is in an inconsistent state. In that case the stats
 // returned may be incomplete or invalid.
@@ -847,7 +925,15 @@ func (s *Store) reapLoop() {
 
 // check repairs any structural inconsistencies in the Store left behind by a
 // crash during snapshotting or reaping: it discards an incomplete reap plan,
-// resumes an interrupted reap, and removes leftover temporary directories.
+// resumes an interrupted reap, and runs receiving-side reconciliation, which
+// removes only this node's interrupted snapshot temporary directories and
+// registered staging directories, validates the committed snapshot chain, and
+// explicitly requests a full snapshot (FULL_NEEDED) when the chain is broken.
+//
+// Externally copied snapshots and other foreign files are never removed. If
+// reconciliation finds a discrepancy it cannot safely judge, check returns an
+// error describing exactly what was found and the Store must not be used until
+// it is resolved.
 //
 // Check does NOT verify file checksums. That is done lazily, exactly once, the
 // first time snapshot data is about to be used -- see Verify, Open, and Reap.
@@ -900,19 +986,12 @@ func (s *Store) check() error {
 		}
 	}
 
-	// Anything remaining is truly temporary and can now be cleaned up.
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return fmt.Errorf("reading store directory: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() && isTmpName(e.Name()) {
-			tmpPath := filepath.Join(s.dir, e.Name())
-			s.logger.Printf("removing leftover temporary directory %s", tmpPath)
-			if err := fsutil.RemoveAll(tmpPath); err != nil {
-				return fmt.Errorf("removing temporary directory %s: %w", tmpPath, err)
-			}
-		}
+	// Reconcile the store against its local snapshot chain: remove this
+	// node's interrupted temporary directories and registered staging
+	// directories, explicitly request a full snapshot if the committed chain
+	// is broken, and stop with a detailed error if anything is ambiguous.
+	if _, err := NewReconciler(s.dir, s.stagingPaths, s.logger).Reconcile(nil); err != nil {
+		return err
 	}
 	return nil
 }

@@ -27,6 +27,13 @@ type snapshotTypeController interface {
 	SetDueNext(Type) error
 }
 
+// incomingChainReconciler is implemented by stores that can reconcile their
+// local snapshot chain against the authoritative chain delivered by an
+// incoming full-snapshot install. *Store satisfies it.
+type incomingChainReconciler interface {
+	ReconcileIncoming(chain *IncomingChain) error
+}
+
 // Sink is a sink for writing snapshot data to a Snapshot store.
 //
 // This sink is adaptive. It can handle multiple types of snapshot data,
@@ -260,6 +267,21 @@ func (s *Sink) Close() (retErr error) {
 	}
 	if err := fsutil.SyncDirMaybe(s.dir); err != nil {
 		return err
+	}
+
+	// The full frame is self-contained and has just been committed as a new
+	// full snapshot, anchoring the local chain. Reconcile the receiving store
+	// against the authoritative target it delivered: sweep only this node's
+	// interrupted intermediates, and if the local chain cannot be matched,
+	// return the detailed conflict so the node stops rather than continuing
+	// on an unverifiable chain. This is a remote-install path, so unlike an
+	// IncrementalFile failure this error is returned, not fatal.
+	if full := s.header.GetFull(); full != nil {
+		if rc, ok := s.stc.(incomingChainReconciler); ok {
+			if err := rc.ReconcileIncoming(chainForInstall(s.meta, full)); err != nil {
+				return fmt.Errorf("reconciliation after snapshot install failed: %w", err)
+			}
+		}
 	}
 
 	if s.closeCh != nil {

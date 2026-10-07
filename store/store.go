@@ -579,8 +579,12 @@ func (s *Store) Open() (retErr error) {
 		return fmt.Errorf("failed to upgrade v8 snapshots: %s", err)
 	}
 
-	// Create store for the Snapshots.
-	snapshotStore, err := snapshot.NewStore(s.snapshotDir)
+	// Create store for the Snapshots. The WAL staging directory is registered
+	// as a node-owned staging path so the snapshot store's receiving-side
+	// reconciliation removes it when it was left behind by an interrupted
+	// snapshot, using the same ownership rules as interrupted sink
+	// directories.
+	snapshotStore, err := snapshot.NewStore(s.snapshotDir, snapshot.WithStagingPaths(s.walStagingDir))
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot store: %s", err)
 	}
@@ -805,13 +809,12 @@ func (s *Store) Open() (retErr error) {
 	}
 	s.checkpointer = s.db
 
-	// Clean up any files from aborted operations. This tries to catch the case where scratch files
-	// were created in the Raft directory, not cleaned up, and then the node was restarted with an
-	// explicit SQLite path set. The only way a Staging Directory should be present is if a snapshot
-	// operation was in progress and the node crashed.
-	if err := fsutil.RemoveAll(s.walStagingDir); err != nil {
-		return fmt.Errorf("failed to remove pre-existing WAL staging directory: %s", err.Error())
-	}
+	// Clean up scratch files from aborted operations. This tries to catch the case where scratch
+	// files were created in the Raft directory, not cleaned up, and then the node was restarted with
+	// an explicit SQLite path set.
+	//
+	// The WAL staging directory itself is cleaned up earlier, by the snapshot
+	// store's receiving-side reconciliation when the store is created.
 	for _, pattern := range []string{
 		restoreScratchPattern,
 		bootScatchPattern,

@@ -119,6 +119,27 @@ The `StagingDir` type manages a temporary directory where WAL files are staged b
 
 A key property of the staging directory is **persistence across failed snapshots**. If `Persist` fails after the WAL has been written and closed (but before the snapshot is finalized), the staging directory retains the WAL files. The next snapshot attempt can pick them up rather than requiring a full snapshot. This significantly reduces the frequency of full snapshots compared to earlier versions of rqlite.
 
+## Receiving-side Reconciliation
+
+A node that is restarted and upgraded, or that repeatedly receives snapshots from the leader, can have an interrupted snapshot transfer leave intermediary files on disk: an interrupted sink's `term-index-msec.tmp` directory and a leftover WAL staging directory. A node can also end up holding committed incremental snapshots whose full baseline is gone (a broken chain), for example after manual intervention. Rather than deleting the whole snapshot directory and rebuilding, the Store runs a **receiving-side reconciliation** (`Reconciler`) that compares the local artifacts against an authoritative incoming snapshot chain.
+
+The authoritative chain is an `IncomingChain` descriptor: a target link (ID/term/index/kind) and, when the information is available in-process, the ordered links from the full baseline to the target. The wire protocol always delivers a self-contained full frame (DB plus the ordered WAL sequence, each CRC32-protected), so a remote install supplies the target coordinates and the file checksums even though the leader-side link IDs are not on the wire; the engine never invents identity matches for links it was not told about.
+
+Every entry in the store root is classified before anything is touched:
+
+- **Node-owned intermediates** — directories named `term-index-msec.tmp` (the only naming a sink temporary directory ever has) and staging paths explicitly registered with the Store (the FSM WAL staging directory). Only these are ever removed, and the operations are idempotent.
+- **Committed snapshots** — snapshot-shaped directories that load successfully. These are *never* deleted, including valid snapshots copied in externally.
+- **Foreign entries** — files and directories whose names do not parse as snapshot IDs. They are left untouched and reported in the reconcile result.
+- **Ambiguous entries** — snapshot-shaped directories that fail to load (possibly a half-copied external snapshot), and `.tmp` directories whose names do not parse as snapshot IDs (provenance cannot be proved). These stop reconciliation with a detailed error.
+
+Reconciliation has three outcomes:
+
+1. **OK**: the committed chain is complete (the newest full is followed only by incrementals), it does not disagree with the authoritative chain, and node-owned intermediates have been swept. Identity checks compare every supplied chain link that exists locally (term/index and kind must agree); links missing locally are expected on a catching-up receiver because the full frame is self-contained. A local committed snapshot ahead of the authoritative target, or any link identity/kind disagreement, is an error instead.
+2. **Full required**: committed incrementals exist with no full baseline. The durable `FULL_NEEDED` flag is set so the next snapshot must be a full one; the next successful full install clears it. Reruns are stable and converge once the full snapshot lands (older orphaned incrementals are reaped once the new full anchors the chain).
+3. **Conflict** (`ErrReconcileConflict`): something cannot be matched safely. No file is changed at all — all analysis precedes any mutation — and startup (`NewStore` via `check`) fails with the precise reasons and paths, so the node stops for manual resolution rather than guessing.
+
+Reconciliation runs at startup inside `check()` (local-only pass) and after every successful incoming full-snapshot install in `Sink.Close` (against the just-delivered authoritative target). It is also exposed as `Store.Reconcile`, which blocks for the MRSW write lock. The post-install pass in `Sink.Close` is deliberately non-blocking: if snapshot readers (a slow follower transfer) or a reap are active, it defers to the next install or startup rather than stalling snapshot completion — the store's non-blocking-snapshot-read guarantee is preserved, and all cleanup is idempotent. Neither pass runs concurrently with a reap; manual `Store.Reconcile` must not be invoked while an install is in progress.
+
 ## Wire Format
 
 Snapshot data is framed using a simple protocol defined in `snapshot/proto/snapshot.proto`:
@@ -137,7 +158,7 @@ The `SnapshotHeader` protobuf uses a `oneof` payload:
 
 ## Store Lifecycle
 
-1. **Startup** (`NewStore`): Creates the store directory, runs `check()` to clean up temporary directories and resume interrupted reap plans, and starts the reaper goroutine.
+1. **Startup** (`NewStore`): Creates the store directory, runs `check()` to resume interrupted reap plans and run receiving-side reconciliation (sweep only node-owned interrupted intermediates, request a full snapshot if the committed chain is broken, stop with a detailed error on ambiguity), and starts the reaper goroutine.
 
 2. **Creating snapshots** (`Create`): Acquires a read lock, creates a `Sink` in a temporary directory, returns a `LockingSink` to Raft.
 
