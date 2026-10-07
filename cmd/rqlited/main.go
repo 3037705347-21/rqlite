@@ -321,12 +321,21 @@ func startAutoBackups(ctx context.Context, cfg *Config, str *store.Store) (*back
 		return nil, fmt.Errorf("failed to read auto-backup file: %s", err.Error())
 	}
 
-	uCfg, sc, err := backup.NewStorageClient(b)
+	uCfg, destinations, err := backup.NewStorageClients(b)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse auto-backup file: %s", err.Error())
 	}
 	provider := store.NewProvider(str, uCfg.Vacuum, !uCfg.NoCompress)
-	u := backup.NewUploader(sc, provider, time.Duration(uCfg.Interval))
+
+	var u *backup.Uploader
+	if len(uCfg.Destinations) > 0 {
+		u, err = backup.NewUploaderMulti(destinations, provider, time.Duration(uCfg.Interval))
+		if err != nil {
+			return nil, fmt.Errorf("failed to start auto-backups: %s", err.Error())
+		}
+	} else {
+		u = backup.NewUploader(destinations[0].Client, provider, time.Duration(uCfg.Interval))
+	}
 	u.Start(ctx, str.IsLeader)
 	return u, nil
 }

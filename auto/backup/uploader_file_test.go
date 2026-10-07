@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"expvar"
+	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -142,14 +144,113 @@ func Test_Uploader_FileStorage(t *testing.T) {
 	}
 
 	dataPath := storageClient.LatestFilePath(context.Background())
-	if dataPath == "" {
-		t.Fatal("latest file path is empty")
-	}
 	data, err := os.ReadFile(dataPath)
 	if err != nil {
 		t.Fatalf("failed to read data file: %s", err.Error())
 	}
 	if string(data) != "my upload data" {
 		t.Fatalf("data mismatch: got %q want %q", string(data), "my upload data")
+	}
+}
+
+// Test_MultiUploader_RestartReconcile_File verifies that a freshly-started
+// multi-destination uploader reconciles each file target from its
+// METADATA.json: already-current targets are not re-uploaded, while a target
+// that holds nothing is caught up with the current generation.
+func Test_MultiUploader_RestartReconcile_File(t *testing.T) {
+	ResetStats()
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	newClients := func(aDir, bDir string) []*file.Client {
+		ca, err := file.NewClient(aDir, "db.sqlite", nil)
+		if err != nil {
+			t.Fatalf("file client a: %s", err)
+		}
+		cb, err := file.NewClient(bDir, "db.sqlite", nil)
+		if err != nil {
+			t.Fatalf("file client b: %s", err)
+		}
+		return []*file.Client{ca, cb}
+	}
+	destinationsFor := func(clients []*file.Client) []Destination {
+		dests := make([]Destination, len(clients))
+		for i, c := range clients {
+			dests[i] = Destination{Name: fmt.Sprintf("dir-%c", 'a'+rune(i)), Client: c}
+		}
+		return dests
+	}
+
+	dp := &mockDataProvider{data: "shared backup bytes"}
+
+	// First run: both destinations receive generation 1.
+	clients := newClients(dirA, dirB)
+	u, err := NewUploaderMulti(destinationsFor(clients), dp, time.Second)
+	if err != nil {
+		t.Fatalf("NewUploaderMulti: %s", err)
+	}
+	if err := u.uploadMulti(context.Background()); err != nil {
+		t.Fatalf("first generation: %s", err)
+	}
+	for i, c := range clients {
+		id, err := c.CurrentID(context.Background())
+		if err != nil || id != "1" {
+			t.Fatalf("destination %d: expected ID 1, got %q (%v)", i, id, err)
+		}
+	}
+
+	// Simulate an uploader restart against the same directories. Both
+	// targets already hold generation 1, so nothing is uploaded.
+	u2, err := NewUploaderMulti(destinationsFor(newClients(dirA, dirB)), dp, time.Second)
+	if err != nil {
+		t.Fatalf("NewUploaderMulti: %s", err)
+	}
+	okBefore := stats.Get(numUploadsOK).(*expvar.Int).Value()
+	if err := u2.uploadMulti(context.Background()); err != nil {
+		t.Fatalf("reconciliation cycle: %s", err)
+	}
+	if stats.Get(numUploadsOK).(*expvar.Int).Value() != okBefore {
+		t.Fatalf("expected no uploads when all destinations are current")
+	}
+	if stats.Get(numUploadsSkippedID).(*expvar.Int).Value() < 2 {
+		t.Fatalf("expected both current destinations to be skipped by ID")
+	}
+	st, _ := u2.Stats()
+	if st["generation_complete"] != true {
+		t.Fatalf("expected reconciled generation to be complete")
+	}
+
+	// Another restart, but target b's directory is empty: only b is caught
+	// up; a is not re-uploaded.
+	dirBEmpty := t.TempDir()
+	clients3 := newClients(dirA, dirBEmpty)
+	u3, err := NewUploaderMulti(destinationsFor(clients3), dp, time.Second)
+	if err != nil {
+		t.Fatalf("NewUploaderMulti: %s", err)
+	}
+	if err := u3.uploadMulti(context.Background()); err != nil {
+		t.Fatalf("catch-up cycle: %s", err)
+	}
+	idB, err := clients3[1].CurrentID(context.Background())
+	if err != nil {
+		t.Fatalf("destination b current ID: %s", err)
+	}
+	if idB != "1" {
+		t.Fatalf("expected caught-up destination b to hold generation 1, got %s", idB)
+	}
+	data, err := os.ReadFile(clients3[1].LatestFilePath(context.Background()))
+	if err != nil {
+		t.Fatalf("read caught-up backup: %s", err)
+	}
+	if string(data) != "shared backup bytes" {
+		t.Fatalf("caught-up data mismatch: %q", string(data))
+	}
+	st3, _ := u3.Stats()
+	destStats := st3["destinations"].([]map[string]any)
+	if destStats[0]["last_uploaded_id"] != "1" || destStats[1]["last_uploaded_id"] != "1" {
+		t.Fatalf("expected both destinations to be at generation 1, got %+v", destStats)
+	}
+	if st3["generation_complete"] != true {
+		t.Fatalf("expected generation to be complete after catching destination b up")
 	}
 }

@@ -165,10 +165,10 @@ func TestNewStorageClient(t *testing.T) {
 		{
 			name: "InvalidVersion",
 			input: []byte(`
-			{
-				"version": 2,
-				"type": "s3",
-				"timeout": "5m",
+		{
+			"version": 3,
+			"type": "s3",
+			"timeout": "5m",
 				"sub": {
 					"access_key_id": "test_id",
 					"secret_access_key": "test_secret",

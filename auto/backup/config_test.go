@@ -257,7 +257,7 @@ func Test_NewStorageClient(t *testing.T) {
 			name: "InvalidVersion",
 			input: []byte(`
 			{
-				"version": 2,
+				"version": 3,
 				"type": "s3",
 				"no_compress": false,
 				"interval": "24h",
@@ -411,4 +411,281 @@ func mustGCSCredFile(t *testing.T) string {
 	}
 	f.Close()
 	return f.Name()
+}
+
+func Test_NewStorageClients_V1Single(t *testing.T) {
+	tempDir := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+	input := []byte(`
+	{
+		"version": 1,
+		"type": "file",
+		"interval": "30s",
+		"sub": {
+			"dir": "` + tempDir + `",
+			"name": "backup.sqlite"
+		}
+	}`)
+	cfg, dests, err := NewStorageClients(input)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(dests) != 1 {
+		t.Fatalf("expected 1 destination, got %d", len(dests))
+	}
+	if cfg.Type != auto.StorageTypeFile {
+		t.Fatalf("expected file type, got %s", cfg.Type)
+	}
+}
+
+func Test_NewStorageClients_V2Multi(t *testing.T) {
+	gcsCredsFile := mustGCSCredFile(t)
+	defer fsutil.Remove(gcsCredsFile)
+	dirA := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+	dirB := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+
+	input := []byte(fmt.Appendf(nil, `
+	{
+		"version": 2,
+		"interval": "1m",
+		"vacuum": true,
+		"destinations": [
+			{
+				"name": "local-a",
+				"type": "file",
+				"sub": {"dir": "%s", "name": "a.sqlite"}
+			},
+			{
+				"name": "local-b",
+				"type": "file",
+				"timestamp": true,
+				"sub": {"dir": "%s", "name": "b.sqlite"}
+			},
+			{
+				"name": "gcs-dr",
+				"type": "gcs",
+				"sub": {
+					"bucket": "test_bucket",
+					"name": "test/path",
+					"project_id": "test_project",
+					"credentials_path": %q
+				}
+			}
+		]
+	}`, dirA, dirB, gcsCredsFile))
+
+	cfg, dests, err := NewStorageClients(input)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(dests) != 3 {
+		t.Fatalf("expected 3 destinations, got %d", len(dests))
+	}
+	if !cfg.Vacuum {
+		t.Fatalf("expected vacuum to be true")
+	}
+	names := []string{"local-a", "local-b", "gcs-dr"}
+	for i, name := range names {
+		if dests[i].Name != name {
+			t.Fatalf("destination %d: expected name %s, got %s", i, name, dests[i].Name)
+		}
+		if dests[i].Client == nil {
+			t.Fatalf("destination %d: nil client", i)
+		}
+	}
+	if _, ok := dests[2].Client.(*gcp.GCSClient); !ok {
+		t.Fatalf("expected GCSClient for 3rd destination, got %T", dests[2].Client)
+	}
+}
+
+func Test_NewStorageClients_DefaultNames(t *testing.T) {
+	dirA := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+	dirB := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+	input := []byte(`
+	{
+		"version": 2,
+		"interval": "30s",
+		"destinations": [
+			{"type": "file", "sub": {"dir": "` + dirA + `", "name": "db.sqlite"}},
+			{"type": "file", "sub": {"dir": "` + dirB + `", "name": "db.sqlite"}}
+		]
+	}`)
+	_, dests, err := NewStorageClients(input)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if dests[0].Name == dests[1].Name {
+		t.Fatalf("expected auto-generated names to be unique, both were %q", dests[0].Name)
+	}
+}
+
+func Test_NewStorageClients_Errors(t *testing.T) {
+	dir := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+
+	testCases := []struct {
+		name       string
+		input      []byte
+		errContain string
+	}{
+		{
+			name: "EmptyDestinations",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": []
+			}`),
+			errContain: "destinations",
+		},
+		{
+			name: "DestinationsRequireV2",
+			input: []byte(`
+			{
+				"version": 1,
+				"interval": "30s",
+				"destinations": [
+					{"type": "file", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: "version 2",
+		},
+		{
+			name: "V2WithTopLevelType",
+			input: []byte(`
+			{
+				"version": 2,
+				"type": "file",
+				"interval": "30s",
+				"destinations": [
+					{"type": "file", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: `"type"`,
+		},
+		{
+			name: "V2WithTopLevelTimestamp",
+			input: []byte(`
+			{
+				"version": 2,
+				"timestamp": true,
+				"interval": "30s",
+				"destinations": [
+					{"type": "file", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: `"timestamp"`,
+		},
+		{
+			name: "UnknownTopLevelField",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"bogus": true,
+				"destinations": [
+					{"type": "file", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: "unknown field",
+		},
+		{
+			name: "UnknownDestinationField",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": [
+					{"type": "file", "bogus": true, "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: "unknown field",
+		},
+		{
+			name: "DuplicateNames",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": [
+					{"name": "same", "type": "file", "sub": {"dir": "` + dir + `", "name": "a.sqlite"}},
+					{"name": "same", "type": "file", "sub": {"dir": "` + dir + `", "name": "b.sqlite"}}
+				]
+			}`),
+			errContain: "duplicate backup destination name",
+		},
+		{
+			name: "DestinationMissingType",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": [
+					{"name": "bad", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: "missing type",
+		},
+		{
+			name: "DestinationMissingSub",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": [
+					{"name": "bad", "type": "file"}
+				]
+			}`),
+			errContain: "missing sub-config",
+		},
+		{
+			name: "DestinationBadSub",
+			input: []byte(`
+			{
+				"version": 2,
+				"interval": "30s",
+				"destinations": [
+					{"name": "bad", "type": "file", "sub": {"dir": "relative/path", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: `"bad"`,
+		},
+		{
+			name: "MissingInterval",
+			input: []byte(`
+			{
+				"version": 2,
+				"destinations": [
+					{"type": "file", "sub": {"dir": "` + dir + `", "name": "db.sqlite"}}
+				]
+			}`),
+			errContain: auto.ErrInvalidInterval.Error(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := NewStorageClients(tc.input)
+			if err == nil {
+				t.Fatalf("expected an error containing %q, got nil", tc.errContain)
+			}
+			if !strings.Contains(err.Error(), tc.errContain) {
+				t.Fatalf("expected error containing %q, got %v", tc.errContain, err)
+			}
+		})
+	}
+}
+
+func Test_NewStorageClient_RejectsV2Multi(t *testing.T) {
+	dir := strings.ReplaceAll(t.TempDir(), `\`, `\\`)
+	input := []byte(`
+	{
+		"version": 2,
+		"interval": "30s",
+		"destinations": [
+			{"name": "a", "type": "file", "sub": {"dir": "` + dir + `", "name": "a.sqlite"}},
+			{"name": "b", "type": "file", "sub": {"dir": "` + dir + `", "name": "b.sqlite"}}
+		]
+	}`)
+	if _, _, err := NewStorageClient(input); err == nil {
+		t.Fatalf("expected NewStorageClient to reject multi-destination config")
+	}
 }

@@ -8,7 +8,7 @@ import (
 
 const (
 	// Version is the max version of the config file format supported
-	Version = 1
+	Version = 2
 )
 
 var (
