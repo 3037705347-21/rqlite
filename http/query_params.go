@@ -149,6 +149,12 @@ func (qp QueryParams) Key() string {
 	return qp["key"]
 }
 
+// ID returns the client-supplied stable request identifier used by
+// durable queued writes.
+func (qp QueryParams) ID() string {
+	return qp["id"]
+}
+
 // DBTimeout returns the value of the key named "db_timeout".
 func (qp QueryParams) DBTimeout(def time.Duration) time.Duration {
 	t, ok := qp["db_timeout"]

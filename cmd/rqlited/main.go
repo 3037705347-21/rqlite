@@ -503,6 +503,10 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	s.DefaultQueueBatchSz = cfg.WriteQueueBatchSz
 	s.DefaultQueueTimeout = cfg.WriteQueueTimeout
 	s.DefaultQueueTx = cfg.WriteQueueTx
+	s.QueueDurability = cfg.WriteQueueDurability
+	if s.QueueDurability {
+		s.QueueLedgerPath = filepath.Join(cfg.DataPath, "queue-state.db")
+	}
 	s.BuildInfo = map[string]any{
 		"commit":             cmd.Commit,
 		"version":            cmd.Version,

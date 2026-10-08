@@ -942,6 +942,7 @@ func (db *DB) ExecuteWithContext(ctx context.Context, req *command.Request, xTim
 type execerQueryer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 func (db *DB) executeWithConn(ctx context.Context, req *command.Request, xTime bool, conn *sql.Conn) (allResults []*command.ExecuteQueryResponse, retErr error) {
@@ -949,7 +950,11 @@ func (db *DB) executeWithConn(ctx context.Context, req *command.Request, xTime b
 
 	eqer := execerQueryer(conn)
 	var tx *sql.Tx
-	if req.Transaction {
+	// A request carrying an idempotency key always executes inside a
+	// transaction: recording the dedup key and applying the user statements
+	// must commit atomically, so a replay cannot apply statements without
+	// the dedup record (or vice versa).
+	if req.Transaction || req.IdempotencyKey != "" {
 		stats.Add(numETx, 1)
 		var err error
 		tx, err = conn.BeginTx(ctx, nil)
@@ -962,6 +967,20 @@ func (db *DB) executeWithConn(ctx context.Context, req *command.Request, xTime b
 			}
 		}()
 		eqer = tx
+	}
+
+	if req.IdempotencyKey != "" {
+		duplicated, err := db.lookupOrInsertIdempotencyKey(ctx, eqer, req)
+		if err != nil {
+			return nil, err
+		}
+		if duplicated {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			tx = nil
+			return []*command.ExecuteQueryResponse{{Duplicated: true}}, nil
+		}
 	}
 
 	// handleError sets the error field on the given result. It returns

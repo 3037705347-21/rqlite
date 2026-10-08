@@ -35,6 +35,11 @@ message Request {
 	int64 dbTimeout = 3;
 	bool rollbackOnError = 4;
 	bool qualifyColumns = 5;
+	// IdempotencyKey is a client-supplied stable identifier for a write
+	// request. When non-empty, the FSM records the key in the same
+	// transaction as the statements and skips re-execution of any
+	// already-recorded request with identical content.
+	string idempotencyKey = 6;
 }
 
 enum ConsistencyLevel {
@@ -91,6 +96,9 @@ message ExecuteQueryResponse {
 	// Set when a statement succeeds through the write path. This is conservative:
 	// no rows may have changed, or the transaction may subsequently be rolled back.
 	bool mutated = 4;
+	// Set when the write was not executed because an identical idempotency
+	// key has already been applied by the FSM.
+	bool duplicated = 5;
 	oneof result {
 		QueryRows q = 1;
 		ExecuteResult e = 2;

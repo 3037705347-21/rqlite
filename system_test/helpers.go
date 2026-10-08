@@ -67,6 +67,10 @@ type Node struct {
 	Client       *cluster.Client
 	Mux          *tcp.Mux
 	CDC          *cdc.Service
+
+	// DurableQueue, when set before node construction, enables the
+	// fsynced, idempotent queued-write ledger at <Dir>/queue-state.db.
+	DurableQueue bool
 }
 
 // SameAs returns true if this node is the same as node o.
@@ -879,6 +883,10 @@ func mustNodeEncryptedCDC(id, dir string, enableSingle, httpEncrypt bool, mux *t
 	// Lower for testing to reduce pressure on CI systems.
 	node.Service.DefaultQueueBatchSz = 8
 	node.Service.DefaultQueueCap = 64
+	if node.DurableQueue {
+		node.Service.QueueDurability = true
+		node.Service.QueueLedgerPath = filepath.Join(node.Dir, "queue-state.db")
+	}
 
 	if err := node.Service.Start(); err != nil {
 		node.Deprovision()

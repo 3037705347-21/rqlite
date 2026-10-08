@@ -126,6 +126,8 @@ type Config struct {
 	WriteQueueTx bool
 	// How many times to retry a queued write
 	WriteQueueRetry int
+	// Use a durable, idempotent ledger for Queued Writes
+	WriteQueueDurability bool
 	// Path to automatic backup configuration file. If not set, not enabled
 	AutoBackupFile string
 	// Path to automatic restore configuration file. If not set, not enabled
@@ -220,6 +222,8 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.DurationVar(&config.WriteQueueTimeout, "write-queue-timeout", mustParseDuration("50ms"), "Queued Writes queue timeout")
 	fs.BoolVar(&config.WriteQueueTx, "write-queue-tx", false, "Use a transaction when processing a queued write")
 	fs.IntVar(&config.WriteQueueRetry, "write-queue-retry", 1, "How many times to retry a queued write")
+	fs.BoolVar(&config.WriteQueueDurability, "write-queue-durability", false,
+		"Persist queued writes to a durable, idempotent ledger in the data directory. Clients must supply a stable 'id' query parameter; identical ids with different content freeze the queued-write channel")
 	fs.StringVar(&config.AutoBackupFile, "auto-backup", "", "Path to automatic backup configuration file. If not set, not enabled")
 	fs.StringVar(&config.AutoRestoreFile, "auto-restore", "", "Path to automatic restore configuration file. If not set, not enabled")
 	fs.StringVar(&config.CDCConfig, "cdc-config", "", "Set CDC HTTP endpoint, or path to CDC config file. If not set, CDC not enabled")

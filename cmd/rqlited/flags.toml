@@ -618,6 +618,17 @@ If a node fails to send to a queued write to the Leader it will retry the attemp
 default = 1
 
 [[flags]]
+name = "WriteQueueDurability"
+cli = "write-queue-durability"
+section = "Queued Writes"
+type = "bool"
+short_help = "Persist queued writes to a durable, idempotent ledger"
+long_help = """
+Enable durable, exactly-once Queued Writes. Every queued write must carry a stable client-supplied 'id' query parameter. Accepted requests are fsynced to a ledger file (queue-state.db) in the data directory before the HTTP response is sent; requests still pending after a restart or Leader change are retried in order, and an id already applied with identical content is skipped by the Raft state machine so writes are never duplicated. If the same id is reused with different content, if a queued statement fails (its transaction rolls back with zero effect), or if the ledger fails its integrity check on startup, the queued-write channel is frozen: new queued writes are rejected with HTTP 503 and draining stops until the condition is resolved and the node restarted (ordinary, non-queued writes are unaffected); a failed statement requires the underlying data to be fixed and the node restarted so the identical request can be replayed. Retries must keep the request body byte-identical. Enable only after every node in the cluster has been upgraded, and drain queued writes before performing a full database load. User schemas must not create a table named 'rqlite_internal_queued_requests'; it is the reserved internal table used for cluster-wide deduplication.
+"""
+default = false
+
+[[flags]]
 name = "AutoBackupFile"
 cli = "auto-backup"
 section = "Backup and restore"

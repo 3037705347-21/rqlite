@@ -55,8 +55,12 @@ func (c *CDCCollator) Events() []*command.CDCEvent {
 }
 
 // PreupdateHook records a change made by the transaction in progress. The
-// event is not returned by Events until that transaction commits.
+// event is not returned by Events until that transaction commits. Changes to
+// reserved internal tables are never exposed to CDC consumers.
 func (c *CDCCollator) PreupdateHook(ev *command.CDCEvent) error {
+	if ev != nil && ev.Table == IdempotencyTable {
+		return nil
+	}
 	c.pending = append(c.pending, ev)
 	return nil
 }

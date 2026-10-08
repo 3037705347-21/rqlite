@@ -182,21 +182,29 @@ const (
 	numQueuedExecutionsRetryLimited   = "queued_executions_retry_limited"
 	numQueuedExecutionsWait           = "queued_executions_wait"
 	numQueuedExecutionsWaitTimeout    = "queued_executions_wait_timeout"
-	numQueries                        = "queries"
-	numQueryStmtsRx                   = "query_stmts_rx"
-	numRequests                       = "requests"
-	numRequestStmtsRx                 = "request_stmts_rx"
-	numReadyz                         = "num_readyz"
-	numStatus                         = "num_status"
-	numBackups                        = "backups"
-	numLoad                           = "loads"
-	numBoot                           = "boot"
-	numSnapshots                      = "user_snapshots"
-	numReaps                          = "user_reaps"
-	numSQLAnalyze                     = "sql_analyze"
-	numAuthOK                         = "auth_ok"
-	numAuthFail                       = "auth_fail"
-	numTLSCertFetched                 = "tls_cert_fetched"
+
+	numQueuedDurableRx         = "queued_durable_rx"
+	numQueuedDurableCommitted  = "queued_durable_committed"
+	numQueuedDurableReplayed   = "queued_durable_replayed"
+	numQueuedDurablePruned     = "queued_durable_pruned"
+	numQueuedDurableFrozen     = "queued_durable_frozen"
+	numQueuedDurableDuplicated = "queued_durable_duplicated"
+
+	numQueries        = "queries"
+	numQueryStmtsRx   = "query_stmts_rx"
+	numRequests       = "requests"
+	numRequestStmtsRx = "request_stmts_rx"
+	numReadyz         = "num_readyz"
+	numStatus         = "num_status"
+	numBackups        = "backups"
+	numLoad           = "loads"
+	numBoot           = "boot"
+	numSnapshots      = "user_snapshots"
+	numReaps          = "user_reaps"
+	numSQLAnalyze     = "sql_analyze"
+	numAuthOK         = "auth_ok"
+	numAuthFail       = "auth_fail"
+	numTLSCertFetched = "tls_cert_fetched"
 
 	// default queued write retry count.
 	defaultQueueRetry = 1
@@ -256,6 +264,12 @@ func ResetStats() {
 	stats.Add(numQueuedExecutionsRetryLimited, 0)
 	stats.Add(numQueuedExecutionsWait, 0)
 	stats.Add(numQueuedExecutionsWaitTimeout, 0)
+	stats.Add(numQueuedDurableRx, 0)
+	stats.Add(numQueuedDurableCommitted, 0)
+	stats.Add(numQueuedDurableReplayed, 0)
+	stats.Add(numQueuedDurablePruned, 0)
+	stats.Add(numQueuedDurableFrozen, 0)
+	stats.Add(numQueuedDurableDuplicated, 0)
 	stats.Add(numQueries, 0)
 	stats.Add(numQueryStmtsRx, 0)
 	stats.Add(numRequests, 0)
@@ -287,6 +301,12 @@ type Service struct {
 
 	queueDone chan struct{}
 	stmtQueue *queue.Queue[*proto.Statement] // Queue for queued executes
+
+	// Durable queued-write state. When QueueDurability is true the durable
+	// manager and its ledger replace the in-memory queue.
+	durableQ        *durableQueueManager
+	QueueDurability bool
+	QueueLedgerPath string
 
 	cluster Cluster // The Cluster service.
 
@@ -401,10 +421,14 @@ func (s *Service) Start() error {
 	s.closeCh = make(chan struct{})
 	s.queueDone = make(chan struct{})
 
-	s.stmtQueue = queue.New[*proto.Statement](s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout)
-	go s.runQueue()
-	s.logger.Printf("execute queue processing started with capacity %d, batch size %d, timeout %s",
-		s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout.String())
+	if s.QueueDurability {
+		s.startDurableQueue()
+	} else {
+		s.stmtQueue = queue.New[*proto.Statement](s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout)
+		go s.runQueue()
+		s.logger.Printf("execute queue processing started with capacity %d, batch size %d, timeout %s",
+			s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout.String())
+	}
 
 	go func() {
 		err := s.httpServer.Serve(s.ln)
@@ -422,6 +446,11 @@ func (s *Service) Close() {
 	s.logger.Println("closing HTTP service on", s.ln.Addr().String())
 	if err := s.httpServer.Close(); err != nil {
 		s.logger.Println("HTTP service close error:", err.Error())
+	}
+
+	if s.QueueDurability {
+		s.closeDurableQueue()
+		return
 	}
 
 	s.stmtQueue.Close()
@@ -963,15 +992,20 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request, qp QueryP
 		oss["hostname"] = hostname
 	}
 
-	qs, err := s.stmtQueue.Stats()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("queue stats: %s", err.Error()),
-			http.StatusInternalServerError)
-		return
-	}
-	qs["sequence_number"] = atomic.LoadInt64(&s.seqNum)
-	queueStats := map[string]any{
-		"_default": qs,
+	queueStats := map[string]any{}
+	if s.QueueDurability {
+		if s.durableQ != nil {
+			queueStats["durability"] = s.durableQ.stats()
+		}
+	} else {
+		qs, err := s.stmtQueue.Stats()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("queue stats: %s", err.Error()),
+				http.StatusInternalServerError)
+			return
+		}
+		qs["sequence_number"] = atomic.LoadInt64(&s.seqNum)
+		queueStats["_default"] = qs
 	}
 	httpStatus := map[string]any{
 		"bind_addr": s.Addr().String(),
@@ -1355,6 +1389,11 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request, qp Query
 	}
 	if err := sql.Process(stmts, !qp.NoRewriteRandom(), !qp.NoRewriteTime()); err != nil {
 		http.Error(w, fmt.Sprintf("SQL rewrite: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if s.QueueDurability {
+		s.durableAdmit(w, r, qp, stmts)
 		return
 	}
 
